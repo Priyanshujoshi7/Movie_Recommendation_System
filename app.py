@@ -3,136 +3,177 @@ import pandas as pd
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 
-# -----------------------------------------------------------
-# STEP 1: LOAD DATA
-# -----------------------------------------------------------
+# -------------------------------------------
+# PAGE SETTINGS
+# -------------------------------------------
+st.set_page_config(page_title="Movie Recommender", layout="wide")
 
-# We load the MovieLens dataset from your local "archive" folder.
-# movies.csv contains movie titles & genres
-# ratings.csv contains user ratings for each movie
-movies = pd.read_csv("archive/movies.csv")
-ratings = pd.read_csv("archive/ratings.csv")
+# -------------------------------------------
+# LOAD DATA
+# -------------------------------------------
+@st.cache_data
+def load_data():
+    movies = pd.read_csv("archive/movies.csv")
+    ratings = pd.read_csv("archive/ratings.csv")
+    movies["genres"] = movies["genres"].apply(lambda x: x.split("|"))
+    return movies, ratings
 
-# Convert the "genres" column from a single string
-# into a list of genres (e.g., "Action|Comedy" → ["Action","Comedy"])
-movies['genres'] = movies['genres'].apply(lambda x: x.split('|'))
+movies, ratings = load_data()
 
-# -----------------------------------------------------------
-# STEP 2: CREATE USER–ITEM MATRIX
-# -----------------------------------------------------------
+# Map ids → titles
+movie_titles = movies.set_index("movieId")["title"].to_dict()
 
-# Convert the ratings into a "pivot table" where:
-# Rows   = userId
-# Columns = movieId
-# Values  = the rating given by the user
-# Missing values are filled with 0 (meaning: user did not rate)
-user_item_matrix = ratings.pivot_table(
-    index='userId',
-    columns='movieId',
-    values='rating'
-).fillna(0)
+# -------------------------------------------
+# SIMILARITY MATRIX
+# -------------------------------------------
+@st.cache_resource
+def build_similarity(ratings_df):
+    user_item_matrix = ratings_df.pivot_table(
+        index='userId',
+        columns='movieId',
+        values='rating'
+    ).fillna(0)
 
-# For cosine similarity, we need movies × users instead of users × movies
-item_user_matrix = user_item_matrix.T  # transpose the matrix
+    item_user_matrix = user_item_matrix.T
 
-# -----------------------------------------------------------
-# STEP 3: COMPUTE MOVIE–MOVIE COSINE SIMILARITY
-# -----------------------------------------------------------
+    sim = cosine_similarity(item_user_matrix)
+    return pd.DataFrame(sim, index=item_user_matrix.index, columns=item_user_matrix.index)
 
-# Cosine similarity tells us how similar two movies are,
-# based on how users rated them (ratings pattern).
-# A higher score = more similar.
-similarity_df = pd.DataFrame(
-    cosine_similarity(item_user_matrix),
-    index=item_user_matrix.index,     # movieIds as rows
-    columns=item_user_matrix.index    # movieIds as columns
-)
+similarity_df = build_similarity(ratings)
 
-# -----------------------------------------------------------
-# STEP 4: RECOMMENDATION FUNCTION
-# -----------------------------------------------------------
+# -------------------------------------------
+# SESSION STATE
+# -------------------------------------------
+if "liked_movies" not in st.session_state:
+    st.session_state.liked_movies = []
 
-def recommend_movies(user_likes, selected_genre, top_n=10):
-    """
-    This function takes:
-      - user_likes: list of movieIds the user likes
-      - selected_genre: genre chosen by the user
-      - top_n: how many movies to recommend
+if "excluded_movies" not in st.session_state:
+    st.session_state.excluded_movies = []
 
-    It returns the top-N recommended movies using:
-      1. Cosine similarity between movies
-      2. User-selected genre filtering
-    """
+if "last_recs" not in st.session_state:
+    st.session_state.last_recs = None
+
+
+# -------------------------------------------
+# RECOMMENDER FUNCTION
+# -------------------------------------------
+def recommend_movies(user_likes, selected_genre, excluded_ids, top_n=10):
     all_scores = {}
 
-    # For each movie the user likes → find similar movies
     for movie_id in user_likes:
         if movie_id not in similarity_df.index:
             continue
 
-        # Get similarity scores for all movies vs the liked movie
-        sim_scores = similarity_df[movie_id]
-
-        # Accumulate similarity scores across all liked movies
-        for sim_movie_id, score in sim_scores.items():
-            # Avoid recommending the same movies user already liked
-            if sim_movie_id in user_likes:
+        for sim_movie_id, score in similarity_df[movie_id].items():
+            if sim_movie_id in user_likes or sim_movie_id in excluded_ids:
                 continue
-
             all_scores[sim_movie_id] = all_scores.get(sim_movie_id, 0) + score
 
-    # Sort movies based on total similarity score
-    sorted_movies = sorted(all_scores.items(), key=lambda x: x[1], reverse=True)
+    # Sort by score
+    ranked = sorted(all_scores.items(), key=lambda x: x[1], reverse=True)
+    top_ids = [m for m, _ in ranked[:150]]
 
-    # Pick top 50 candidates before applying genre filter
-    top_ids = [m for m, _ in sorted_movies[:50]]
+    candidates = movies[movies["movieId"].isin(top_ids)].copy()
 
-    # Convert IDs to actual movie titles
-    candidates = movies[movies['movieId'].isin(top_ids)]
-
-    # If a genre is selected → filter only those movies
     if selected_genre != "All":
-        candidates = candidates[candidates['genres'].apply(lambda x: selected_genre in x)]
+        candidates = candidates[candidates["genres"].apply(lambda gs: selected_genre in gs)]
 
-    # Return final top-N recommendations
     return candidates.head(top_n)
 
-# -----------------------------------------------------------
-# STEP 5: STREAMLIT USER INTERFACE
-# -----------------------------------------------------------
 
+# -------------------------------------------
+# SIDEBAR — LIKED MOVIES
+# -------------------------------------------
+st.sidebar.header("❤️ Movies You Like")
+
+if st.session_state.liked_movies:
+    for mid in st.session_state.liked_movies:
+        st.sidebar.write(f"• {movie_titles[mid]}")
+else:
+    st.sidebar.write("No liked movies yet.")
+
+
+# -------------------------------------------
+# UI — MAIN LAYOUT
+# -------------------------------------------
 st.title("🎬 Movie Recommendation System")
-st.write("Select movies you like and a genre to get personalized recommendations.")
 
-# Dictionary of movieId → title (for dropdown)
-movie_dict = movies.set_index("movieId")["title"].to_dict()
+col_input, col_output = st.columns([1, 2])
 
-# Multi-select dropdown for choosing liked movies
-selected_likes = st.multiselect(
-    "🎞️ Pick movies you like:",
-    options=list(movie_dict.keys()),
-    format_func=lambda x: movie_dict[x]
-)
+with col_input:
+    st.subheader("1️⃣ Select Movies You Like")
 
-# Extract all genres from dataset (unique + sorted)
-all_genres = sorted(list({
-    g
-    for genre_list in movies['genres']
-    for g in genre_list
-}))
+    selected_likes = st.multiselect(
+        "🎞️ Choose one or more movies:",
+        options=movies["movieId"].tolist(),
+        format_func=lambda x: movie_titles[x]
+    )
 
-# Genre selection dropdown
-selected_genre = st.selectbox("🎭 Pick a genre:", ["All"] + all_genres)
+    st.subheader("2️⃣ Select Genre")
+    all_genres = sorted({g for row in movies["genres"] for g in row})
+    selected_genre = st.selectbox("Genre:", ["All"] + all_genres)
 
-# When user clicks "Recommend", run the recommender
-if st.button("Recommend"):
-    if len(selected_likes) == 0:
-        st.warning("⚠️ Select at least one movie.")
+    if st.button("🔄 Reset All", use_container_width=True):
+        st.session_state.liked_movies = []
+        st.session_state.excluded_movies = []
+        st.session_state.last_recs = None
+        st.rerun()
+
+    if st.button("✨ Get Recommendations", use_container_width=True):
+        st.session_state.last_recs = recommend_movies(
+            user_likes=selected_likes,
+            selected_genre=selected_genre,
+            excluded_ids=st.session_state.excluded_movies,
+            top_n=10
+        )
+
+
+# -------------------------------------------
+# OUTPUT — SHOW RECOMMENDED MOVIES
+# -------------------------------------------
+with col_output:
+    st.subheader("⭐ Recommended For You")
+
+    recs = st.session_state.last_recs
+
+    if recs is None:
+        st.info("Select movies and click *Get Recommendations*.")
+    elif recs.empty:
+        st.warning("No recommendations found. Try changing genre.")
     else:
-        st.subheader("⭐ Recommended for You")
+        for _, row in recs.iterrows():
+            movie_id = int(row["movieId"])
+            title = row["title"]
+            genres_text = ", ".join(row["genres"])
 
-        # Call our recommendation engine
-        recs = recommend_movies(selected_likes, selected_genre)
+            card = st.container()
+            with card:
+                c1, c2, c3 = st.columns([4, 2, 2])
 
-        # Display results in a table
-        st.table(recs[['title', 'genres']])
+                with c1:
+                    st.markdown(f"**🎬 {title}**")
+                    st.caption(genres_text)
+
+                with c2:
+                    if st.button("❤️ Like", key=f"like_{movie_id}"):
+                        if movie_id not in st.session_state.liked_movies:
+                            st.session_state.liked_movies.append(movie_id)
+                        st.rerun()
+
+                with c3:
+                    if st.button("👀 Remove", key=f"remove_{movie_id}"):
+                        st.session_state.excluded_movies.append(movie_id)
+
+                        # Recompute fresh recommendations  
+                        new_recs = recommend_movies(
+                            user_likes=selected_likes,
+                            selected_genre=selected_genre,
+                            excluded_ids=st.session_state.excluded_movies,
+                            top_n=10
+                        )
+                        st.session_state.last_recs = new_recs
+
+                        # Simulated "animation": remove → replace instantly
+                        st.rerun()
+
+            st.markdown("---")
