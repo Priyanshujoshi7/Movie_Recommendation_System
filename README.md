@@ -1,5 +1,7 @@
 🎬 Movie Recommendation System (Content-Based)
 
+Deployed Link: https://movierecomendationbypriyanshu.streamlit.app/
+
 This project builds a content-based movie recommendation system that suggests similar movies using cosine similarity computed from user–item interactions. By analysing how users rate movies, the system identifies patterns and recommends movies that are most similar to a selected movie.
 
 🔍 Key Features
